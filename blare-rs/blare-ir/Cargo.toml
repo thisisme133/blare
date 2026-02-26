@@ -1,0 +1,10 @@
+[package]
+name = "blare-ir"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+iced-x86.workspace = true

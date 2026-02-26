@@ -1,0 +1,11 @@
+[package]
+name = "blare-passes"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blare-ir = { path = "../blare-ir" }
+iced-x86.workspace = true

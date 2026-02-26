@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "blare-cli",
+  "blare-cfg",
+  "blare-pe",
+  "blare-ir",
+  "blare-lift",
+  "blare-rewrite",
+  "blare-passes", "blare-module-ext", "blare-protect",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+authors = ["LIFT"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+goblin = "0.10"
+iced-x86 = { version = "1.21.0", features = ["std", "encoder", "decoder", "instr_info"] }
+indexmap = "2.7"

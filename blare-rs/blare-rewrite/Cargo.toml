@@ -1,0 +1,20 @@
+[package]
+name = "blare-rewrite"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+iced-x86.workspace = true
+indexmap.workspace = true
+blare-cfg = { path = "../blare-cfg" }
+blare-ir = { path = "../blare-ir" }
+blare-pe = { path = "../blare-pe" }
+blare-lift = { path = "../blare-lift" }
+blare-passes = { path = "../blare-passes" }
+blare-protect = { path = "../blare-protect" }

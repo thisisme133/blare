@@ -1,0 +1,22 @@
+[package]
+name = "blare-cli"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+iced-x86.workspace = true
+blare-cfg = { path = "../blare-cfg" }
+blare-pe = { path = "../blare-pe" }
+blare-lift = { path = "../blare-lift" }
+blare-rewrite = { path = "../blare-rewrite" }
+blare-passes = { path = "../blare-passes" }

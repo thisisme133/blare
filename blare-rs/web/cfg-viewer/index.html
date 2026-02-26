@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BLARE Compare Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <link rel="stylesheet" href="./styles.css?v=20260226a" />
+  </head>
+  <body>
+    <div class="ambient-bg"></div>
+
+    <main class="viewport">
+      <section class="modal">
+        <header class="modal-head">
+          <div class="title-wrap">
+            <h1>Compare Viewer</h1>
+            <p>Original vs obfusqué avec mapping d'adresses et passes</p>
+          </div>
+          <div class="head-actions">
+            <button id="togglePanelsBtn" class="ghost-btn" type="button">
+              <i class="ph ph-layout"></i> Afficher outils
+            </button>
+            <span id="statusBadge" class="status-badge idle">prêt</span>
+            <button id="loadLastBtn" class="ghost-btn" type="button">
+              <i class="ph ph-clock-counter-clockwise"></i> Dernier run
+            </button>
+          </div>
+        </header>
+
+        <section class="control-strip">
+          <div class="control-card">
+            <div class="control-title"><i class="ph ph-rocket-launch"></i> Lancer Obfuscation</div>
+            <div class="control-grid">
+              <label>
+                EXE input
+                <input id="exePathInput" type="text" placeholder="/private/tmp/imgui_dx9_x64_demo.exe" />
+              </label>
+              <label>
+                CFG input
+                <input id="cfgPathInput" type="text" placeholder="/private/tmp/imgui_dx9_x64_demo.ghidra.json" />
+              </label>
+              <label>
+                Profil
+                <select id="profileSelect">
+                  <option value="balanced">balanced</option>
+                  <option value="aggressive">aggressive</option>
+                  <option value="sigbreaker">sigbreaker</option>
+                </select>
+              </label>
+              <label>
+                Seed
+                <input id="seedInput" type="number" placeholder="1337" />
+              </label>
+              <label>
+                Rewrite policy
+                <select id="rewritePolicySelect">
+                  <option value="module">module</option>
+                  <option value="per-function">per-function</option>
+                </select>
+              </label>
+              <label>
+                Section layout
+                <select id="sectionLayoutSelect">
+                  <option value="keep">keep</option>
+                  <option value="compact">compact</option>
+                </select>
+              </label>
+            </div>
+            <div class="control-actions">
+              <label class="check-row"><input id="strictUnwindInput" type="checkbox" checked /> strict-unwind</label>
+              <button id="runObfBtn" class="primary-btn" type="button">
+                <i class="ph ph-play"></i> Obfusquer + Comparer
+              </button>
+            </div>
+          </div>
+
+          <div class="control-card">
+            <div class="control-title"><i class="ph ph-files"></i> Charger JSON de Comparaison</div>
+            <div class="control-grid">
+              <label>
+                JSON gauche (original)
+                <input id="leftJsonPathInput" type="text" placeholder="/tmp/original.cytoscape.json" />
+              </label>
+              <label>
+                JSON droite (obfusqué)
+                <input id="rightJsonPathInput" type="text" placeholder="/tmp/rewritten.cytoscape.json" />
+              </label>
+              <label>
+                Map (optionnel)
+                <input id="mapJsonPathInput" type="text" placeholder="/tmp/rewrite.map.json" />
+              </label>
+            </div>
+            <div class="control-actions">
+              <button id="loadCompareBtn" class="ghost-btn" type="button">
+                <i class="ph ph-folder-open"></i> Charger la comparaison
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <div class="modal-body">
+          <aside class="left-pane">
+            <div class="search-row-wrap">
+              <div class="search-row">
+                <i class="ph ph-magnifying-glass search-icon"></i>
+                <input id="searchInput" type="text" placeholder="Rechercher une fonction..." />
+              </div>
+              <button id="sortBtn" class="ghost-btn icon-only" type="button" title="Trier par nom">
+                <i class="ph ph-sort-ascending"></i>
+              </button>
+            </div>
+
+            <div class="list-stats">
+              <span id="listStats"><i class="ph ph-list-numbers"></i> 0 sur 0</span>
+            </div>
+
+            <div id="functionList" class="function-list"></div>
+          </aside>
+
+          <section class="right-pane">
+            <div class="compare-summary">
+              <div class="summary-card">
+                <h2 id="selectedFnName">-</h2>
+                <div class="summary-grid">
+                  <div><span class="k">Ancienne adresse</span><span id="selectedOldAddr" class="v">-</span></div>
+                  <div><span class="k">Nouvelle adresse</span><span id="selectedNewAddr" class="v">-</span></div>
+                  <div><span class="k">Mutation blocs</span><span id="selectedMutation" class="v">-</span></div>
+                  <div><span class="k">Fallback</span><span id="selectedFallback" class="v">-</span></div>
+                </div>
+              </div>
+
+              <div class="summary-card">
+                <div class="summary-title">Passes utilisées</div>
+                <div class="pass-meta">
+                  <span>profil: <strong id="passProfile">-</strong></span>
+                  <span>seed: <strong id="passSeed">-</strong></span>
+                  <span>rewritten bytes: <strong id="rewrittenBytes">-</strong></span>
+                </div>
+                <div id="passList" class="pass-list"></div>
+                <div class="pass-stats-wrap">
+                  <table class="pass-stats-table">
+                    <thead>
+                      <tr>
+                        <th>pass</th>
+                        <th>fns</th>
+                        <th>blocks</th>
+                        <th>instr</th>
+                        <th>inj</th>
+                        <th>skip</th>
+                      </tr>
+                    </thead>
+                    <tbody id="passStatsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="graphs-grid">
+              <article class="graph-panel">
+                <div class="graph-head">
+                  <div>
+                    <div class="graph-title">Original</div>
+                    <div id="leftFnMeta" class="graph-meta">-</div>
+                  </div>
+                  <div class="graph-tools-inline">
+                    <button class="graph-tool" data-side="left" data-action="zoomIn" type="button" title="Zoom +"><i class="ph ph-magnifying-glass-plus"></i></button>
+                    <button class="graph-tool" data-side="left" data-action="zoomOut" type="button" title="Zoom -"><i class="ph ph-magnifying-glass-minus"></i></button>
+                    <button class="graph-tool" data-side="left" data-action="fit" type="button" title="Fit"><i class="ph ph-corners-out"></i></button>
+                    <button class="graph-tool" data-side="left" data-action="layout" type="button" title="Layout"><i class="ph ph-tree-structure"></i></button>
+                  </div>
+                </div>
+                <div class="graph-shell"><div id="cyLeft"></div></div>
+              </article>
+
+              <article class="graph-panel">
+                <div class="graph-head">
+                  <div>
+                    <div class="graph-title">Obfusqué</div>
+                    <div id="rightFnMeta" class="graph-meta">-</div>
+                  </div>
+                  <div class="graph-tools-inline">
+                    <button class="graph-tool" data-side="right" data-action="zoomIn" type="button" title="Zoom +"><i class="ph ph-magnifying-glass-plus"></i></button>
+                    <button class="graph-tool" data-side="right" data-action="zoomOut" type="button" title="Zoom -"><i class="ph ph-magnifying-glass-minus"></i></button>
+                    <button class="graph-tool" data-side="right" data-action="fit" type="button" title="Fit"><i class="ph ph-corners-out"></i></button>
+                    <button class="graph-tool" data-side="right" data-action="layout" type="button" title="Layout"><i class="ph ph-tree-structure"></i></button>
+                  </div>
+                </div>
+                <div class="graph-shell"><div id="cyRight"></div></div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+    <script src="https://unpkg.com/cytoscape/dist/cytoscape.min.js"></script>
+    <script src="https://unpkg.com/cytoscape-dagre/cytoscape-dagre.js"></script>
+    <script src="https://unpkg.com/cytoscape-node-html-label/dist/cytoscape-node-html-label.js"></script>
+    <script src="./app.js?v=20260226a"></script>
+  </body>
+</html>

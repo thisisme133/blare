@@ -1,0 +1,11 @@
+[package]
+name = "blare-module-ext"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+goblin.workspace = true
