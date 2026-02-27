@@ -80,6 +80,11 @@ pub fn build_profile_pass_with_options(
     match profile {
         ObfuscationProfile::Balanced | ObfuscationProfile::Aggressive => {
             let aggressive = profile.is_aggressive();
+            // Constant synthesis early: hide magic numbers before other passes
+            passes.push(Box::new(OpaqueConstantSynthesisPass {
+                seed: seed ^ 0xb3c7_1e4d_92a5_6f08,
+                aggressive,
+            }));
             passes.push(Box::new(MbaNonLinearPass {
                 seed: seed ^ 0x09f4_729e_f4a7_2f13,
                 aggressive,
@@ -93,6 +98,11 @@ pub fn build_profile_pass_with_options(
                 aggressive,
             }));
             if aggressive {
+                // Dead stores: pollute pseudocode with phantom variables
+                passes.push(Box::new(DeadStoreInjectionPass {
+                    seed: seed ^ 0xe1f2_3b5c_7d89_a0b4,
+                    aggressive,
+                }));
                 passes.push(Box::new(LoopEncodedSemanticsPass {
                     seed: seed ^ 0xd4aa_8f3b_73b2_0c5d,
                     min_amount: 2,
@@ -108,6 +118,20 @@ pub fn build_profile_pass_with_options(
                 }));
                 passes.push(Box::new(IdaDecompilerCrasherPass {
                     seed: seed ^ 0x9ca8_37db_2f8e_4ad1,
+                    aggressive,
+                }));
+                // Control flow flattening: destroy structured control flow
+                passes.push(Box::new(ControlFlowFlatteningPass {
+                    seed: seed ^ 0xa4d8_6c3f_1b5e_97a2,
+                }));
+                // Push-ret: fragment functions by replacing jmp with push+ret
+                passes.push(Box::new(PushRetBranchPass {
+                    seed: seed ^ 0x7b2e_d4a1_93f5_c806,
+                    probability: 0.3,
+                }));
+                // String reference obfuscation: break xrefs to strings
+                passes.push(Box::new(StringReferenceObfuscationPass {
+                    seed: seed ^ 0xf9c1_5d7e_a2b3_0846,
                     aggressive,
                 }));
             }
@@ -141,6 +165,10 @@ pub fn build_profile_pass_with_options(
             }));
         }
         ObfuscationProfile::Custom => {
+            passes.push(Box::new(OpaqueConstantSynthesisPass {
+                seed: seed ^ 0xb3c7_1e4d_92a5_6f08,
+                aggressive: true,
+            }));
             passes.push(Box::new(MbaNonLinearPass {
                 seed: seed ^ 0x09f4_729e_f4a7_2f13,
                 aggressive: true,
@@ -155,6 +183,10 @@ pub fn build_profile_pass_with_options(
             }));
             passes.push(Box::new(ObscureReferencesPass {
                 seed: seed ^ 0x4b7a_11df_8a6e_99c3,
+                aggressive: true,
+            }));
+            passes.push(Box::new(StringReferenceObfuscationPass {
+                seed: seed ^ 0xf9c1_5d7e_a2b3_0846,
                 aggressive: true,
             }));
         }
@@ -1331,6 +1363,1284 @@ impl Pass for IdaDecompilerCrasherPass {
             skipped_sites,
         );
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass: OpaqueConstantSynthesisPass
+// Replaces immediate constants with runtime-computed equivalents to hide
+// semantic meaning of magic numbers (loop counts, ASCII bases, etc.)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct OpaqueConstantSynthesisPass {
+    seed: u64,
+    aggressive: bool,
+}
+
+impl Pass for OpaqueConstantSynthesisPass {
+    fn name(&self) -> &'static str {
+        "opaque-constant-synthesis"
+    }
+
+    fn run(&self, ir: &mut ProgramIr) -> Result<()> {
+        let mut allocator = SyntheticRvaAllocator::new(ir);
+        let mut info_factory = InstructionInfoFactory::new();
+
+        let mut mutated_functions = HashSet::<FunctionId>::new();
+        let mut mutated_blocks = HashSet::<BlockId>::new();
+        let mut mutated_instructions = 0usize;
+        let mut skipped_sites = 0usize;
+
+        for fidx in 0..ir.functions.len() {
+            if ir.functions[fidx].fallback {
+                continue;
+            }
+            let function_id = ir.functions[fidx].id;
+            let block_ids = ir.functions[fidx].blocks.clone();
+
+            for block_id in block_ids {
+                let block_start = ir.block(block_id).start_rva;
+                let original_ids = ir.block(block_id).insts.clone();
+                if original_ids.len() < 2 {
+                    continue;
+                }
+
+                let mut rebuilt = Vec::with_capacity(original_ids.len() * 2);
+                for (inst_index, inst_id) in original_ids.iter().enumerate() {
+                    let inst = ir.inst(*inst_id).instruction;
+
+                    if inst_index + 1 < original_ids.len()
+                        && should_inject(
+                            self.seed,
+                            block_start,
+                            inst_index as u64,
+                            self.aggressive,
+                            2,
+                        )
+                    {
+                        if let Some((dst_reg, imm_val, mnemonic)) =
+                            extract_constant_synthesis_target(inst)
+                        {
+                            let xor_key =
+                                derive_xor_key_i32(self.seed, block_start, inst_index as u64);
+                            let sext_key = xor_key as i64 as u64;
+
+                            match mnemonic {
+                                Mnemonic::Mov => {
+                                    // mov reg, imm -> mov reg, (imm^sext_key); xor reg, key
+                                    let encoded = (imm_val as u64) ^ sext_key;
+                                    if self.aggressive {
+                                        let rot =
+                                            ((mix_seed(self.seed, block_start ^ inst_index as u64)
+                                                >> 5)
+                                                & 0xF) as u32
+                                                | 1;
+                                        let pre_rot = encoded.rotate_left(rot);
+                                        let mov_enc = Instruction::with2(
+                                            Code::Mov_r64_imm64,
+                                            dst_reg,
+                                            pre_rot,
+                                        )
+                                        .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            mov_enc,
+                                        ));
+                                        let ror_inst = Instruction::with2(
+                                            Code::Ror_rm64_imm8,
+                                            dst_reg,
+                                            rot,
+                                        )
+                                        .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            ror_inst,
+                                        ));
+                                        mutated_instructions += 1;
+                                    } else {
+                                        let mov_enc = Instruction::with2(
+                                            Code::Mov_r64_imm64,
+                                            dst_reg,
+                                            encoded,
+                                        )
+                                        .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            mov_enc,
+                                        ));
+                                    }
+                                    let xor_dec = Instruction::with2(
+                                        Code::Xor_rm64_imm32,
+                                        dst_reg,
+                                        xor_key,
+                                    )
+                                    .map_err(anyhow_from_iced)?;
+                                    rebuilt.push(ir.add_instruction(
+                                        block_id,
+                                        allocator.next_inst(),
+                                        xor_dec,
+                                    ));
+                                    mutated_instructions += 2;
+                                    mutated_blocks.insert(block_id);
+                                    mutated_functions.insert(function_id);
+                                    continue; // skip adding original inst
+                                }
+                                Mnemonic::Cmp | Mnemonic::Add | Mnemonic::Sub => {
+                                    // Need scratch register for non-mov ops
+                                    if let Some(tmp) = choose_one_scratch_reg(
+                                        &inst,
+                                        &mut info_factory,
+                                        &[dst_reg],
+                                    ) {
+                                        let encoded = (imm_val as u64) ^ sext_key;
+                                        let push_tmp = Instruction::with1(Code::Push_r64, tmp)
+                                            .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            push_tmp,
+                                        ));
+                                        let mov_enc = Instruction::with2(
+                                            Code::Mov_r64_imm64,
+                                            tmp,
+                                            encoded,
+                                        )
+                                        .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            mov_enc,
+                                        ));
+                                        let xor_dec = Instruction::with2(
+                                            Code::Xor_rm64_imm32,
+                                            tmp,
+                                            xor_key,
+                                        )
+                                        .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            xor_dec,
+                                        ));
+                                        // Emit the original operation but with register operand
+                                        let code = match mnemonic {
+                                            Mnemonic::Cmp => Code::Cmp_rm64_r64,
+                                            Mnemonic::Add => Code::Add_rm64_r64,
+                                            Mnemonic::Sub => Code::Sub_rm64_r64,
+                                            _ => unreachable!(),
+                                        };
+                                        let op_inst =
+                                            Instruction::with2(code, dst_reg, tmp)
+                                                .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            op_inst,
+                                        ));
+                                        // pop does NOT modify flags -> safe after cmp/add/sub
+                                        let pop_tmp = Instruction::with1(Code::Pop_r64, tmp)
+                                            .map_err(anyhow_from_iced)?;
+                                        rebuilt.push(ir.add_instruction(
+                                            block_id,
+                                            allocator.next_inst(),
+                                            pop_tmp,
+                                        ));
+                                        mutated_instructions += 5;
+                                        mutated_blocks.insert(block_id);
+                                        mutated_functions.insert(function_id);
+                                        continue; // skip adding original inst
+                                    } else {
+                                        skipped_sites += 1;
+                                    }
+                                }
+                                _ => {
+                                    skipped_sites += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    rebuilt.push(*inst_id);
+                }
+
+                if rebuilt != original_ids {
+                    ir.block_mut(block_id).insts = rebuilt;
+                }
+            }
+        }
+
+        record_pass_outcome(
+            ir,
+            self.name(),
+            mutated_functions.len(),
+            mutated_blocks.len(),
+            mutated_instructions,
+            0,
+            skipped_sites,
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass: DeadStoreInjectionPass
+// Injects meaningless computations to create phantom variables in decompiler
+// output, polluting the pseudocode with irrelevant expressions.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct DeadStoreInjectionPass {
+    seed: u64,
+    aggressive: bool,
+}
+
+impl Pass for DeadStoreInjectionPass {
+    fn name(&self) -> &'static str {
+        "dead-store-injection"
+    }
+
+    fn run(&self, ir: &mut ProgramIr) -> Result<()> {
+        let mut allocator = SyntheticRvaAllocator::new(ir);
+        let mut info_factory = InstructionInfoFactory::new();
+
+        let mut mutated_functions = HashSet::<FunctionId>::new();
+        let mut mutated_blocks = HashSet::<BlockId>::new();
+        let mut mutated_instructions = 0usize;
+        let mut skipped_sites = 0usize;
+
+        for fidx in 0..ir.functions.len() {
+            if ir.functions[fidx].fallback {
+                continue;
+            }
+            let function_id = ir.functions[fidx].id;
+            let block_ids = ir.functions[fidx].blocks.clone();
+
+            for block_id in block_ids {
+                let block_start = ir.block(block_id).start_rva;
+                let original_ids = ir.block(block_id).insts.clone();
+                if original_ids.len() < 2 {
+                    continue;
+                }
+
+                let mut rebuilt = Vec::with_capacity(original_ids.len() * 2);
+                for (inst_index, inst_id) in original_ids.iter().enumerate() {
+                    rebuilt.push(*inst_id);
+
+                    // Inject dead stores AFTER certain instructions (not the last one)
+                    if inst_index + 1 >= original_ids.len() {
+                        continue;
+                    }
+                    if !should_inject(
+                        self.seed,
+                        block_start,
+                        inst_index as u64,
+                        self.aggressive,
+                        3,
+                    ) {
+                        continue;
+                    }
+
+                    let inst = ir.inst(*inst_id).instruction;
+                    let Some((tmp1, tmp2)) =
+                        choose_two_scratch_regs(inst, &mut info_factory, &[])
+                    else {
+                        skipped_sites += 1;
+                        continue;
+                    };
+
+                    let site_seed = mix_seed(self.seed, block_start ^ inst_index as u64);
+                    let template = (site_seed >> 3) % 3;
+                    let c1 = ((site_seed >> 7) as u32 | 1) as i32;
+                    let c2 = ((site_seed >> 19) as u32 | 1) as i32;
+                    let c3 = ((site_seed >> 31) as u32 | 1) as i32;
+
+                    // Save registers and flags
+                    let push_t1 = Instruction::with1(Code::Push_r64, tmp1)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(
+                        block_id,
+                        allocator.next_inst(),
+                        push_t1,
+                    ));
+                    let push_t2 = Instruction::with1(Code::Push_r64, tmp2)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(
+                        block_id,
+                        allocator.next_inst(),
+                        push_t2,
+                    ));
+                    let pushfq = Instruction::with(Code::Pushfq);
+                    rebuilt.push(ir.add_instruction(
+                        block_id,
+                        allocator.next_inst(),
+                        pushfq,
+                    ));
+
+                    // Dead computation (varies by template)
+                    match template {
+                        0 => {
+                            // Template 0: imul + xor + ror
+                            let mov_c = Instruction::with2(Code::Mov_r64_imm64, tmp1, c1 as i64 as u64)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), mov_c));
+                            let imul_inst = Instruction::with3(Code::Imul_r64_rm64_imm32, tmp1, tmp1, c2)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), imul_inst));
+                            let xor_inst = Instruction::with2(Code::Xor_rm64_imm32, tmp1, c3)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), xor_inst));
+                            let mov_t2 = Instruction::with2(Code::Mov_rm64_r64, tmp2, tmp1)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), mov_t2));
+                            let ror_inst = Instruction::with2(Code::Ror_rm64_imm8, tmp2, 7u32)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), ror_inst));
+                            let add_inst = Instruction::with2(Code::Add_rm64_r64, tmp1, tmp2)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), add_inst));
+                            mutated_instructions += 6;
+                        }
+                        1 => {
+                            // Template 1: mov + and + or + not pattern
+                            let mov_c = Instruction::with2(Code::Mov_r64_imm64, tmp1, c1 as i64 as u64)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), mov_c));
+                            let mov_c2 = Instruction::with2(Code::Mov_r64_imm64, tmp2, c2 as i64 as u64)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), mov_c2));
+                            let and_inst = Instruction::with2(Code::And_rm64_r64, tmp1, tmp2)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), and_inst));
+                            let or_inst = Instruction::with2(Code::Or_rm64_r64, tmp2, tmp1)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), or_inst));
+                            let sub_inst = Instruction::with2(Code::Sub_rm64_r64, tmp1, tmp2)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), sub_inst));
+                            mutated_instructions += 5;
+                        }
+                        _ => {
+                            // Template 2: shift + xor chain
+                            let mov_c = Instruction::with2(Code::Mov_r64_imm64, tmp1, c1 as i64 as u64)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), mov_c));
+                            let shl_inst = Instruction::with2(Code::Shl_rm64_imm8, tmp1, 13u32)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), shl_inst));
+                            let xor_inst = Instruction::with2(Code::Xor_rm64_imm32, tmp1, c2)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), xor_inst));
+                            let shr_inst = Instruction::with2(Code::Shr_rm64_imm8, tmp1, 7u32)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), shr_inst));
+                            let xor2 = Instruction::with2(Code::Xor_rm64_imm32, tmp1, c3)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), xor2));
+                            mutated_instructions += 5;
+                        }
+                    }
+
+                    // Restore flags with TF cleared
+                    let pop_flags = Instruction::with1(Code::Pop_r64, tmp2)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), pop_flags));
+                    let and_tf = Instruction::with2(Code::And_rm64_imm32, tmp2, !0x100i32)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), and_tf));
+                    let push_flags = Instruction::with1(Code::Push_r64, tmp2)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), push_flags));
+                    let popfq = Instruction::with(Code::Popfq);
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), popfq));
+                    let pop_t2 = Instruction::with1(Code::Pop_r64, tmp2)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), pop_t2));
+                    let pop_t1 = Instruction::with1(Code::Pop_r64, tmp1)
+                        .map_err(anyhow_from_iced)?;
+                    rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), pop_t1));
+                    mutated_instructions += 6;
+
+                    mutated_blocks.insert(block_id);
+                    mutated_functions.insert(function_id);
+                }
+
+                if rebuilt != original_ids {
+                    ir.block_mut(block_id).insts = rebuilt;
+                }
+            }
+        }
+
+        record_pass_outcome(
+            ir,
+            self.name(),
+            mutated_functions.len(),
+            mutated_blocks.len(),
+            mutated_instructions,
+            0,
+            skipped_sites,
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass: PushRetBranchPass
+// Replaces jmp target with push+mov+lea+xchg+ret to confuse IDA's call
+// graph analysis and function boundary detection.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct PushRetBranchPass {
+    seed: u64,
+    probability: f64,
+}
+
+impl Pass for PushRetBranchPass {
+    fn name(&self) -> &'static str {
+        "push-ret-branch"
+    }
+
+    fn run(&self, ir: &mut ProgramIr) -> Result<()> {
+        let mut allocator = SyntheticRvaAllocator::new(ir);
+
+        let mut mutated_functions = HashSet::<FunctionId>::new();
+        let mut mutated_blocks = HashSet::<BlockId>::new();
+        let mut mutated_instructions = 0usize;
+        let mut skipped_sites = 0usize;
+
+        for fidx in 0..ir.functions.len() {
+            if ir.functions[fidx].fallback {
+                continue;
+            }
+            let function_id = ir.functions[fidx].id;
+            let block_ids = ir.functions[fidx].blocks.clone();
+
+            for (block_index, block_id) in block_ids.iter().enumerate() {
+                let block_id = *block_id;
+                let block = ir.block(block_id).clone();
+                if block.insts.is_empty() {
+                    continue;
+                }
+
+                let target_rva = match block.terminator {
+                    Terminator::UnconditionalBranch { target } => target,
+                    _ => continue,
+                };
+
+                let last_id = *block.insts.last().expect("non-empty");
+                let last_inst = ir.inst(last_id).instruction;
+                if !last_inst.is_jmp_short_or_near() {
+                    skipped_sites += 1;
+                    continue;
+                }
+
+                if !should_inject_with_probability(
+                    self.seed,
+                    block.start_rva,
+                    block_index as u64,
+                    self.probability,
+                ) {
+                    continue;
+                }
+
+                let decode_key =
+                    derive_thunk_decode_key(self.seed, target_rva, ThunkFlowKind::Branch);
+
+                // Build inline push-ret sequence replacing the jmp
+                let mut rebuilt = Vec::with_capacity(block.insts.len() + 5);
+                for id in &block.insts[..block.insts.len() - 1] {
+                    rebuilt.push(*id);
+                }
+
+                // push rax
+                let push_rax = Instruction::with1(Code::Push_r64, Register::RAX)
+                    .map_err(anyhow_from_iced)?;
+                rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), push_rax));
+
+                // mov rax, 0  (placeholder, patched by rewriter to target_va - decode_key)
+                let load_entry_rva = allocator.next_inst();
+                let mov_placeholder =
+                    Instruction::with2(Code::Mov_r64_imm64, Register::RAX, 0u64)
+                        .map_err(anyhow_from_iced)?;
+                rebuilt.push(ir.add_instruction(block_id, load_entry_rva, mov_placeholder));
+
+                // lea rax, [rax + decode_key]
+                let lea_decode = Instruction::with2(
+                    Code::Lea_r64_m,
+                    Register::RAX,
+                    MemoryOperand::with_base_displ(Register::RAX, decode_key as i64),
+                )
+                .map_err(anyhow_from_iced)?;
+                rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), lea_decode));
+
+                // xchg [rsp], rax
+                let xchg = Instruction::with2(
+                    Code::Xchg_rm64_r64,
+                    MemoryOperand::with_base(Register::RSP),
+                    Register::RAX,
+                )
+                .map_err(anyhow_from_iced)?;
+                rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), xchg));
+
+                // ret
+                let ret = Instruction::with(Code::Retnq);
+                rebuilt.push(ir.add_instruction(block_id, allocator.next_inst(), ret));
+
+                ir.block_mut(block_id).insts = rebuilt;
+
+                // Record thunk for rewriter to patch the mov placeholder
+                ir.add_indirect_thunk_record(
+                    function_id,
+                    block_id,
+                    IndirectThunkKind::Branch,
+                    target_rva,
+                    load_entry_rva,
+                    decode_key,
+                );
+
+                mutated_instructions += 5;
+                mutated_blocks.insert(block_id);
+                mutated_functions.insert(function_id);
+            }
+        }
+
+        record_pass_outcome(
+            ir,
+            self.name(),
+            mutated_functions.len(),
+            mutated_blocks.len(),
+            mutated_instructions,
+            0,
+            skipped_sites,
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass: StringReferenceObfuscationPass
+// Breaks IDA cross-references to strings by replacing RIP-relative LEA
+// instructions (pointing to data) with mov+lea decode sequences.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct StringReferenceObfuscationPass {
+    seed: u64,
+    aggressive: bool,
+}
+
+impl Pass for StringReferenceObfuscationPass {
+    fn name(&self) -> &'static str {
+        "string-reference-obfuscation"
+    }
+
+    fn run(&self, ir: &mut ProgramIr) -> Result<()> {
+        let mut allocator = SyntheticRvaAllocator::new(ir);
+
+        // Collect code addresses so we only obfuscate data references
+        let code_rvas = collect_code_rvas(ir);
+
+        let mut mutated_functions = HashSet::<FunctionId>::new();
+        let mut mutated_blocks = HashSet::<BlockId>::new();
+        let mut mutated_instructions = 0usize;
+        let mut skipped_sites = 0usize;
+
+        for fidx in 0..ir.functions.len() {
+            if ir.functions[fidx].fallback {
+                continue;
+            }
+            let function_id = ir.functions[fidx].id;
+            let block_ids = ir.functions[fidx].blocks.clone();
+
+            for block_id in block_ids {
+                let block_start = ir.block(block_id).start_rva;
+                let original_ids = ir.block(block_id).insts.clone();
+                if original_ids.is_empty() {
+                    continue;
+                }
+
+                let mut rebuilt = Vec::with_capacity(original_ids.len() * 2);
+                let mut block_changed = false;
+
+                for (inst_index, inst_id) in original_ids.iter().enumerate() {
+                    let inst = ir.inst(*inst_id).instruction;
+
+                    // Check: is this a LEA with RIP-relative memory operand?
+                    if inst.mnemonic() == Mnemonic::Lea
+                        && inst.is_ip_rel_memory_operand()
+                        && inst.op_count() >= 2
+                        && inst.op_kind(0) == OpKind::Register
+                        && is_gpr64(inst.op_register(0))
+                        && should_inject(
+                            self.seed,
+                            block_start,
+                            inst_index as u64,
+                            self.aggressive,
+                            2,
+                        )
+                    {
+                        let target_va = inst.ip_rel_memory_address();
+                        if target_va < ir.image_base {
+                            rebuilt.push(*inst_id);
+                            skipped_sites += 1;
+                            continue;
+                        }
+                        let target_rva = target_va - ir.image_base;
+
+                        // Only obfuscate data references, skip code references
+                        if code_rvas.contains(&target_rva) {
+                            rebuilt.push(*inst_id);
+                            skipped_sites += 1;
+                            continue;
+                        }
+
+                        let dst_reg = inst.op_register(0);
+                        let decode_key = derive_thunk_decode_key(
+                            self.seed,
+                            target_rva,
+                            ThunkFlowKind::Branch,
+                        );
+
+                        // mov dst_reg, 0  (placeholder, patched to target_va - decode_key)
+                        let load_entry_rva = allocator.next_inst();
+                        let mov_placeholder = Instruction::with2(
+                            Code::Mov_r64_imm64,
+                            dst_reg,
+                            0u64,
+                        )
+                        .map_err(anyhow_from_iced)?;
+                        rebuilt.push(ir.add_instruction(
+                            block_id,
+                            load_entry_rva,
+                            mov_placeholder,
+                        ));
+
+                        // lea dst_reg, [dst_reg + decode_key]
+                        let lea_decode = Instruction::with2(
+                            Code::Lea_r64_m,
+                            dst_reg,
+                            MemoryOperand::with_base_displ(dst_reg, decode_key as i64),
+                        )
+                        .map_err(anyhow_from_iced)?;
+                        rebuilt.push(ir.add_instruction(
+                            block_id,
+                            allocator.next_inst(),
+                            lea_decode,
+                        ));
+
+                        // Record for rewriter patching + relocation
+                        ir.add_indirect_thunk_record(
+                            function_id,
+                            block_id,
+                            IndirectThunkKind::Branch,
+                            target_rva,
+                            load_entry_rva,
+                            decode_key,
+                        );
+
+                        mutated_instructions += 2;
+                        block_changed = true;
+                        continue; // skip original instruction
+                    }
+
+                    rebuilt.push(*inst_id);
+                }
+
+                if block_changed {
+                    ir.block_mut(block_id).insts = rebuilt;
+                    mutated_blocks.insert(block_id);
+                    mutated_functions.insert(function_id);
+                }
+            }
+        }
+
+        record_pass_outcome(
+            ir,
+            self.name(),
+            mutated_functions.len(),
+            mutated_blocks.len(),
+            mutated_instructions,
+            0,
+            skipped_sites,
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass: ControlFlowFlatteningPass
+// Transforms structured control flow (loops, if/else) into a dispatcher-based
+// state machine. This is the most effective anti-decompilation technique.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct ControlFlowFlatteningPass {
+    seed: u64,
+}
+
+impl Pass for ControlFlowFlatteningPass {
+    fn name(&self) -> &'static str {
+        "control-flow-flattening"
+    }
+
+    fn run(&self, ir: &mut ProgramIr) -> Result<()> {
+        let mut allocator = SyntheticRvaAllocator::new(ir);
+        let mut info_factory = InstructionInfoFactory::new();
+
+        let mut mutated_functions = HashSet::<FunctionId>::new();
+        let mut mutated_blocks = HashSet::<BlockId>::new();
+        let mut mutated_instructions = 0usize;
+        let mut injected_blocks = 0usize;
+        let mut skipped_sites = 0usize;
+
+        for fidx in 0..ir.functions.len() {
+            if ir.functions[fidx].fallback {
+                continue;
+            }
+            let function_id = ir.functions[fidx].id;
+            let block_ids = ir.functions[fidx].blocks.clone();
+
+            if block_ids.len() < 3 {
+                skipped_sites += 1;
+                continue;
+            }
+
+            // Find unused callee-saved register for state variable
+            let Some(state_reg) =
+                find_cff_state_register(ir, &block_ids, &mut info_factory)
+            else {
+                skipped_sites += 1;
+                continue;
+            };
+
+            // Assign state IDs to each block
+            let mut block_state_map = HashMap::<BlockId, u32>::new();
+            let mut rva_state_map = HashMap::<u64, u32>::new();
+            for &bid in &block_ids {
+                let start_rva = ir.block(bid).start_rva;
+                let state = (mix_seed(self.seed, start_rva) as u32) | 0x100;
+                block_state_map.insert(bid, state);
+                rva_state_map.insert(start_rva, state);
+            }
+
+            let entry_block = block_ids[0];
+            let entry_state = block_state_map[&entry_block];
+
+            // Create dispatcher block
+            let dispatcher_start = allocator.next_block();
+            let dispatcher_id = ir.add_block(function_id, dispatcher_start, dispatcher_start + 1);
+            injected_blocks += 1;
+
+            // Build dispatcher: cmp/je chain for each block
+            let mut state_targets = Vec::with_capacity(block_ids.len());
+            for &bid in &block_ids {
+                let state = block_state_map[&bid];
+                let target_rva = ir.block(bid).start_rva;
+
+                let cmp_state = Instruction::with2(Code::Cmp_rm64_imm32, state_reg, state as i32)
+                    .map_err(anyhow_from_iced)?;
+                ir.add_instruction(dispatcher_id, allocator.next_inst(), cmp_state);
+                mutated_instructions += 1;
+
+                let je_block =
+                    Instruction::with_branch(Code::Je_rel32_64, ir.image_base + target_rva)
+                        .map_err(anyhow_from_iced)?;
+                ir.add_instruction(dispatcher_id, allocator.next_inst(), je_block);
+                mutated_instructions += 1;
+
+                ir.add_edge(
+                    dispatcher_id,
+                    Some(bid),
+                    Some(target_rva),
+                    EdgeKind::Branch,
+                    false,
+                );
+
+                state_targets.push((state, target_rva));
+            }
+
+            // Default: jump to entry block (safety)
+            let jmp_default =
+                Instruction::with_branch(Code::Jmp_rel32_64, ir.image_base + ir.block(entry_block).start_rva)
+                    .map_err(anyhow_from_iced)?;
+            ir.add_instruction(dispatcher_id, allocator.next_inst(), jmp_default);
+            mutated_instructions += 1;
+
+            ir.block_mut(dispatcher_id).terminator = Terminator::Dispatcher {
+                state_targets,
+                default_target: ir.block(entry_block).start_rva,
+            };
+            mutated_blocks.insert(dispatcher_id);
+
+            // Create entry wrapper: push state_reg, mov state_reg, init_state, jmp dispatcher
+            let wrapper_start = allocator.next_block();
+            let wrapper_id = ir.add_block(function_id, wrapper_start, wrapper_start + 1);
+            injected_blocks += 1;
+
+            let push_state = Instruction::with1(Code::Push_r64, state_reg)
+                .map_err(anyhow_from_iced)?;
+            ir.add_instruction(wrapper_id, allocator.next_inst(), push_state);
+            mutated_instructions += 1;
+
+            let mov_init = Instruction::with2(
+                Code::Mov_r64_imm64,
+                state_reg,
+                entry_state as u64,
+            )
+            .map_err(anyhow_from_iced)?;
+            ir.add_instruction(wrapper_id, allocator.next_inst(), mov_init);
+            mutated_instructions += 1;
+
+            let jmp_disp =
+                Instruction::with_branch(Code::Jmp_rel32_64, ir.image_base + dispatcher_start)
+                    .map_err(anyhow_from_iced)?;
+            ir.add_instruction(wrapper_id, allocator.next_inst(), jmp_disp);
+            mutated_instructions += 1;
+
+            ir.block_mut(wrapper_id).terminator =
+                Terminator::UnconditionalBranch { target: dispatcher_start };
+            ir.add_edge(
+                wrapper_id,
+                Some(dispatcher_id),
+                Some(dispatcher_start),
+                EdgeKind::Branch,
+                false,
+            );
+            mutated_blocks.insert(wrapper_id);
+
+            // Set the wrapper as the function's entry point
+            // Move wrapper to front of blocks list
+            let func_blocks = &mut ir.functions[fidx].blocks;
+            // Only if wrapper is in the list (it was added by add_block)
+            if let Some(pos) = func_blocks.iter().position(|&b| b == wrapper_id) {
+                func_blocks.remove(pos);
+                func_blocks.insert(0, wrapper_id);
+            }
+            // Also ensure dispatcher is second
+            if let Some(pos) = func_blocks.iter().position(|&b| b == dispatcher_id) {
+                func_blocks.remove(pos);
+                func_blocks.insert(1, dispatcher_id);
+            }
+
+            // Rewrite each original block's terminator to use state machine
+            for &bid in &block_ids {
+                let block = ir.block(bid).clone();
+                let term = block.terminator.clone();
+
+                match term {
+                    Terminator::UnconditionalBranch { target } => {
+                        if let Some(&next_state) = rva_state_map.get(&target) {
+                            // Replace last jmp with: mov state_reg, next_state; jmp dispatcher
+                            let mut rebuilt = Vec::with_capacity(block.insts.len() + 2);
+                            // Keep all insts except the last jmp
+                            if !block.insts.is_empty() {
+                                let last_inst = ir.inst(*block.insts.last().unwrap()).instruction;
+                                if last_inst.is_jmp_short_or_near() {
+                                    for id in &block.insts[..block.insts.len() - 1] {
+                                        rebuilt.push(*id);
+                                    }
+                                } else {
+                                    for id in &block.insts {
+                                        rebuilt.push(*id);
+                                    }
+                                }
+                            }
+
+                            let mov_state = Instruction::with2(
+                                Code::Mov_r64_imm64,
+                                state_reg,
+                                next_state as u64,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), mov_state));
+                            mutated_instructions += 1;
+
+                            let jmp = Instruction::with_branch(
+                                Code::Jmp_rel32_64,
+                                ir.image_base + dispatcher_start,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), jmp));
+                            mutated_instructions += 1;
+
+                            ir.block_mut(bid).insts = rebuilt;
+                            ir.block_mut(bid).terminator =
+                                Terminator::UnconditionalBranch { target: dispatcher_start };
+                            mutated_blocks.insert(bid);
+                        } else {
+                            skipped_sites += 1;
+                        }
+                    }
+                    Terminator::ConditionalBranch { target, fallthrough } => {
+                        let taken_state = rva_state_map.get(&target).copied();
+                        let fall_state = rva_state_map.get(&fallthrough).copied();
+
+                        if let (Some(taken_state), Some(fall_state)) = (taken_state, fall_state) {
+                            // Create trampoline block for taken path
+                            let tramp_start = allocator.next_block();
+                            let tramp_id =
+                                ir.add_block(function_id, tramp_start, tramp_start + 1);
+                            injected_blocks += 1;
+
+                            let mov_taken = Instruction::with2(
+                                Code::Mov_r64_imm64,
+                                state_reg,
+                                taken_state as u64,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            ir.add_instruction(tramp_id, allocator.next_inst(), mov_taken);
+                            mutated_instructions += 1;
+
+                            let jmp_disp2 = Instruction::with_branch(
+                                Code::Jmp_rel32_64,
+                                ir.image_base + dispatcher_start,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            ir.add_instruction(tramp_id, allocator.next_inst(), jmp_disp2);
+                            mutated_instructions += 1;
+
+                            ir.block_mut(tramp_id).terminator =
+                                Terminator::UnconditionalBranch { target: dispatcher_start };
+                            ir.add_edge(
+                                tramp_id,
+                                Some(dispatcher_id),
+                                Some(dispatcher_start),
+                                EdgeKind::Branch,
+                                false,
+                            );
+                            mutated_blocks.insert(tramp_id);
+
+                            // Rewrite block: keep all insts except last jcc, then:
+                            // mov state_reg, fall_state (mov doesn't clobber flags)
+                            // jcc trampoline
+                            // jmp dispatcher
+                            let mut rebuilt = Vec::with_capacity(block.insts.len() + 4);
+                            let mut jcc_code = Code::INVALID;
+                            if !block.insts.is_empty() {
+                                let last_inst = ir.inst(*block.insts.last().unwrap()).instruction;
+                                if last_inst.is_jcc_short_or_near() {
+                                    jcc_code = promote_jcc_to_rel32(last_inst.code());
+                                    for id in &block.insts[..block.insts.len() - 1] {
+                                        rebuilt.push(*id);
+                                    }
+                                } else {
+                                    for id in &block.insts {
+                                        rebuilt.push(*id);
+                                    }
+                                }
+                            }
+
+                            // mov state_reg, fallthrough_state (mov doesn't affect flags!)
+                            let mov_fall = Instruction::with2(
+                                Code::Mov_r64_imm64,
+                                state_reg,
+                                fall_state as u64,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), mov_fall));
+                            mutated_instructions += 1;
+
+                            if jcc_code != Code::INVALID {
+                                // jcc to trampoline (taken path)
+                                let jcc = Instruction::with_branch(
+                                    jcc_code,
+                                    ir.image_base + tramp_start,
+                                )
+                                .map_err(anyhow_from_iced)?;
+                                rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), jcc));
+                                mutated_instructions += 1;
+                            }
+
+                            // jmp dispatcher (fallthrough path)
+                            let jmp_fall = Instruction::with_branch(
+                                Code::Jmp_rel32_64,
+                                ir.image_base + dispatcher_start,
+                            )
+                            .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), jmp_fall));
+                            mutated_instructions += 1;
+
+                            ir.block_mut(bid).insts = rebuilt;
+                            ir.block_mut(bid).terminator = Terminator::ConditionalBranch {
+                                target: tramp_start,
+                                fallthrough: dispatcher_start,
+                            };
+                            ir.block_mut(bid).outgoing_edges.clear();
+                            ir.add_edge(
+                                bid,
+                                Some(tramp_id),
+                                Some(tramp_start),
+                                EdgeKind::Branch,
+                                false,
+                            );
+                            ir.add_edge(
+                                bid,
+                                Some(dispatcher_id),
+                                Some(dispatcher_start),
+                                EdgeKind::Branch,
+                                false,
+                            );
+                            mutated_blocks.insert(bid);
+                        } else {
+                            skipped_sites += 1;
+                        }
+                    }
+                    Terminator::Return => {
+                        // Insert pop state_reg before ret
+                        if !block.insts.is_empty() {
+                            let mut rebuilt = Vec::with_capacity(block.insts.len() + 1);
+                            for id in &block.insts[..block.insts.len() - 1] {
+                                rebuilt.push(*id);
+                            }
+                            let pop_state = Instruction::with1(Code::Pop_r64, state_reg)
+                                .map_err(anyhow_from_iced)?;
+                            rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), pop_state));
+                            mutated_instructions += 1;
+                            rebuilt.push(*block.insts.last().unwrap());
+                            ir.block_mut(bid).insts = rebuilt;
+                            mutated_blocks.insert(bid);
+                        }
+                    }
+                    Terminator::DirectCall { .. } => {
+                        // For DirectCall: keep the call, append state transition
+                        // Find the fallthrough target from edges
+                        let fallthrough_rva = block.outgoing_edges.iter().find_map(|&eid| {
+                            let edge = &ir.edges[eid];
+                            if matches!(edge.kind, EdgeKind::Fallthrough | EdgeKind::Branch) {
+                                edge.target_rva
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some(ft_rva) = fallthrough_rva {
+                            if let Some(&ft_state) = rva_state_map.get(&ft_rva) {
+                                let mut rebuilt = block.insts.clone();
+                                let mov_state = Instruction::with2(
+                                    Code::Mov_r64_imm64,
+                                    state_reg,
+                                    ft_state as u64,
+                                )
+                                .map_err(anyhow_from_iced)?;
+                                rebuilt.push(ir.add_instruction(
+                                    bid,
+                                    allocator.next_inst(),
+                                    mov_state,
+                                ));
+                                mutated_instructions += 1;
+
+                                let jmp = Instruction::with_branch(
+                                    Code::Jmp_rel32_64,
+                                    ir.image_base + dispatcher_start,
+                                )
+                                .map_err(anyhow_from_iced)?;
+                                rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), jmp));
+                                mutated_instructions += 1;
+
+                                ir.block_mut(bid).insts = rebuilt;
+                                mutated_blocks.insert(bid);
+                            }
+                        }
+                    }
+                    Terminator::Fallthrough => {
+                        // Find fallthrough target from edges or next block
+                        let ft_rva = block.outgoing_edges.iter().find_map(|&eid| {
+                            let edge = &ir.edges[eid];
+                            if edge.kind == EdgeKind::Fallthrough {
+                                edge.target_rva
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some(ft_rva) = ft_rva {
+                            if let Some(&ft_state) = rva_state_map.get(&ft_rva) {
+                                let mut rebuilt = block.insts.clone();
+                                let mov_state = Instruction::with2(
+                                    Code::Mov_r64_imm64,
+                                    state_reg,
+                                    ft_state as u64,
+                                )
+                                .map_err(anyhow_from_iced)?;
+                                rebuilt.push(ir.add_instruction(
+                                    bid,
+                                    allocator.next_inst(),
+                                    mov_state,
+                                ));
+                                mutated_instructions += 1;
+
+                                let jmp = Instruction::with_branch(
+                                    Code::Jmp_rel32_64,
+                                    ir.image_base + dispatcher_start,
+                                )
+                                .map_err(anyhow_from_iced)?;
+                                rebuilt.push(ir.add_instruction(bid, allocator.next_inst(), jmp));
+                                mutated_instructions += 1;
+
+                                ir.block_mut(bid).insts = rebuilt;
+                                ir.block_mut(bid).terminator =
+                                    Terminator::UnconditionalBranch { target: dispatcher_start };
+                                mutated_blocks.insert(bid);
+                            }
+                        }
+                    }
+                    _ => {
+                        skipped_sites += 1;
+                    }
+                }
+            }
+
+            mutated_functions.insert(function_id);
+        }
+
+        record_pass_outcome(
+            ir,
+            self.name(),
+            mutated_functions.len(),
+            mutated_blocks.len(),
+            mutated_instructions,
+            injected_blocks,
+            skipped_sites,
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for new passes
+// ---------------------------------------------------------------------------
+
+/// Extracts (dst_register, immediate_value, mnemonic) from instructions
+/// suitable for constant synthesis obfuscation.
+fn extract_constant_synthesis_target(inst: Instruction) -> Option<(Register, i64, Mnemonic)> {
+    if inst.op_count() < 2 {
+        return None;
+    }
+    if inst.op_kind(0) != OpKind::Register {
+        return None;
+    }
+    let dst = inst.op_register(0);
+    if !is_gpr64(dst) || is_stack_or_base_pointer(dst) {
+        return None;
+    }
+    let mnemonic = inst.mnemonic();
+    if !matches!(mnemonic, Mnemonic::Mov | Mnemonic::Cmp | Mnemonic::Add | Mnemonic::Sub) {
+        return None;
+    }
+    let imm = immediate_operand_to_i64(inst, 1)?;
+    // Don't obfuscate zero (too many false positives) or very small adjustments
+    if imm == 0 {
+        return None;
+    }
+    Some((dst, imm, mnemonic))
+}
+
+/// Derives a non-zero i32 XOR key from seed and position.
+fn derive_xor_key_i32(seed: u64, scope: u64, idx: u64) -> i32 {
+    let mixed = mix_seed(seed ^ 0x7C3E_A1D9_52B8_4F06, scope ^ idx);
+    let mut key = (mixed as u32 & 0x7FFF_FFFF) as i32 | 1;
+    if key == 1 {
+        key = 0x5A3B_4C1F;
+    }
+    key
+}
+
+/// Finds an unused callee-saved register (R15, R14, R13, R12) across all
+/// blocks in the given block list. Returns None if all are in use.
+fn find_cff_state_register(
+    ir: &ProgramIr,
+    block_ids: &[BlockId],
+    info_factory: &mut InstructionInfoFactory,
+) -> Option<Register> {
+    let candidates = [Register::R15, Register::R14, Register::R13, Register::R12];
+    for &candidate in &candidates {
+        let mut in_use = false;
+        'outer: for &block_id in block_ids {
+            for &inst_id in &ir.block(block_id).insts {
+                let inst = ir.inst(inst_id).instruction;
+                let regs = used_regs(inst, info_factory, &[]);
+                if regs.contains(&candidate) {
+                    in_use = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !in_use {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Collects all RVAs that correspond to code (function entries and block starts).
+fn collect_code_rvas(ir: &ProgramIr) -> HashSet<u64> {
+    let mut rvas = HashSet::new();
+    for func in &ir.functions {
+        rvas.insert(func.address_rva);
+        for &block_id in &func.blocks {
+            rvas.insert(ir.block(block_id).start_rva);
+        }
+    }
+    rvas
+}
+
+/// Promotes a short/near Jcc code to rel32 form for consistent encoding.
+fn promote_jcc_to_rel32(code: Code) -> Code {
+    match code {
+        Code::Jo_rel8_16 | Code::Jo_rel8_32 | Code::Jo_rel8_64 | Code::Jo_rel32_64 => {
+            Code::Jo_rel32_64
+        }
+        Code::Jno_rel8_16 | Code::Jno_rel8_32 | Code::Jno_rel8_64 | Code::Jno_rel32_64 => {
+            Code::Jno_rel32_64
+        }
+        Code::Jb_rel8_16 | Code::Jb_rel8_32 | Code::Jb_rel8_64 | Code::Jb_rel32_64 => {
+            Code::Jb_rel32_64
+        }
+        Code::Jae_rel8_16 | Code::Jae_rel8_32 | Code::Jae_rel8_64 | Code::Jae_rel32_64 => {
+            Code::Jae_rel32_64
+        }
+        Code::Je_rel8_16 | Code::Je_rel8_32 | Code::Je_rel8_64 | Code::Je_rel32_64 => {
+            Code::Je_rel32_64
+        }
+        Code::Jne_rel8_16 | Code::Jne_rel8_32 | Code::Jne_rel8_64 | Code::Jne_rel32_64 => {
+            Code::Jne_rel32_64
+        }
+        Code::Jbe_rel8_16 | Code::Jbe_rel8_32 | Code::Jbe_rel8_64 | Code::Jbe_rel32_64 => {
+            Code::Jbe_rel32_64
+        }
+        Code::Ja_rel8_16 | Code::Ja_rel8_32 | Code::Ja_rel8_64 | Code::Ja_rel32_64 => {
+            Code::Ja_rel32_64
+        }
+        Code::Js_rel8_16 | Code::Js_rel8_32 | Code::Js_rel8_64 | Code::Js_rel32_64 => {
+            Code::Js_rel32_64
+        }
+        Code::Jns_rel8_16 | Code::Jns_rel8_32 | Code::Jns_rel8_64 | Code::Jns_rel32_64 => {
+            Code::Jns_rel32_64
+        }
+        Code::Jp_rel8_16 | Code::Jp_rel8_32 | Code::Jp_rel8_64 | Code::Jp_rel32_64 => {
+            Code::Jp_rel32_64
+        }
+        Code::Jnp_rel8_16 | Code::Jnp_rel8_32 | Code::Jnp_rel8_64 | Code::Jnp_rel32_64 => {
+            Code::Jnp_rel32_64
+        }
+        Code::Jl_rel8_16 | Code::Jl_rel8_32 | Code::Jl_rel8_64 | Code::Jl_rel32_64 => {
+            Code::Jl_rel32_64
+        }
+        Code::Jge_rel8_16 | Code::Jge_rel8_32 | Code::Jge_rel8_64 | Code::Jge_rel32_64 => {
+            Code::Jge_rel32_64
+        }
+        Code::Jle_rel8_16 | Code::Jle_rel8_32 | Code::Jle_rel8_64 | Code::Jle_rel32_64 => {
+            Code::Jle_rel32_64
+        }
+        Code::Jg_rel8_16 | Code::Jg_rel8_32 | Code::Jg_rel8_64 | Code::Jg_rel32_64 => {
+            Code::Jg_rel32_64
+        }
+        // Fallback: return the original code
+        _ => code,
     }
 }
 

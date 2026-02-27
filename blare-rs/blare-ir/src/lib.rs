@@ -21,6 +21,13 @@ pub enum Terminator {
     Trap,
     Fallthrough,
     Unknown,
+    /// Dispatcher block for control flow flattening.
+    /// Contains a list of (state_value, target_rva) pairs that the dispatcher
+    /// uses to route execution based on a state variable.
+    Dispatcher {
+        state_targets: Vec<(u32, u64)>,
+        default_target: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
